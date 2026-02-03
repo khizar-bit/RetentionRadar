@@ -93,8 +93,32 @@ with st.sidebar.expander("🤖 AI Settings", expanded=True):
     PROMPT_FILE = "prompt_config.json"
 
     def load_prompt():
-        default_prompt = """Write a short, friendly, and persuasive WhatsApp recovery message (maximum 20 words) for a customer named '{name}' who hasn't logged into our app for {days} days.
-Do not include hashtags. Do not include 'Subject:'. Just the message body."""
+        default_prompt = """You are Khizar, a Customer Success Exec at Spur (WhatsApp Automation SaaS).
+
+CONTEXT - WHAT SPUR CAN DO (High-Value Features):
+[WhatsApp Broadcasts, Abandoned Checkout Recovery, Instagram Comment-to-DM Automation, AI Support Chatbots, Shopify Product Linking, Click-to-WhatsApp Ad Flows, Order Confirmation Alerts]
+
+Analyze this specific user data:
+{user_context}
+
+YOUR THOUGHT PROCESS:
+1. Look at the data. Find the "Red Flag" (Inactive, Low ROAS, No Broadcasts).
+2. Pick ONE feature from the [Context] list above that solves their specific problem.
+   - Example: If they have sales but no automation -> Pitch "Abandoned Checkout Recovery".
+   - Example: If they are tired of replying to DMs -> Pitch "AI Support Chatbots".
+   - Example: If they are inactive -> Pitch a "Ready-to-go Broadcast Template".
+
+TASK:
+Write a text message (max 25 words) to this user offering that specific solution.
+
+TONE:
+- You are thumb-typing on a phone. Casual.
+- Use "u" for "you" if it flows better.
+- No "Dear Sir". Start with "Hey [Name]" or just the message.
+- Do NOT say "According to my records". Say "Saw things are quiet..." or "Noticed X..."
+
+OUTPUT:
+Just the message text."""
         if os.path.exists(PROMPT_FILE):
             try:
                 with open(PROMPT_FILE, "r") as f:
@@ -118,7 +142,7 @@ Do not include hashtags. Do not include 'Subject:'. Just the message body."""
         "Edit the instructions for the AI:", 
         value=st.session_state["prompt_input"],
         height=200,
-        help="Use {name} and {days} as placeholders. They will be replaced automatically.",
+        help="Use {user_context} as the placeholder for the entire row of data.",
         key="prompt_input",
         on_change=save_prompt
     )
@@ -132,10 +156,52 @@ if uploaded_file:
     # Load Data
     df = pd.read_csv(uploaded_file)
     
-    # 2. Pre-process Data
+    # 2. Column Mapping
+    st.subheader("📝 Map Your Columns")
+    col1, col2, col3 = st.columns(3)
+    
+    all_cols = list(df.columns)
+    
+    # Helpers for defaults
+    def get_default(options, keywords):
+        for opt in options:
+            if any(k in opt.lower() for k in keywords):
+                return opt
+        return options[0]
+
+    with col1:
+        name_col = st.selectbox("Name Column (Required)", all_cols, index=all_cols.index(get_default(all_cols, ["name", "customer"])))
+    with col2:
+        phone_col = st.selectbox("Phone Column (Required)", all_cols, index=all_cols.index(get_default(all_cols, ["phone", "mobile", "contact"])))
+    with col3:
+        # Optional Last Login
+        login_opts = ["None"] + all_cols
+        default_login = "None"
+        for opt in all_cols:
+            if any(k in opt.lower() for k in ["login", "days", "inactive"]):
+                default_login = opt
+                break
+        login_col = st.selectbox("Days Inactive (Optional)", login_opts, index=login_opts.index(default_login))
+
+    # Rename Columns
+    rename_map = {name_col: 'Name', phone_col: 'Phone'}
+    if login_col != "None":
+        rename_map[login_col] = 'Last_Login_Days'
+    
+    df = df.rename(columns=rename_map)
+
+    # 3. Filtering Logic
     if 'Last_Login_Days' in df.columns:
         # Filter for At Risk Users (> 7 days inactive)
+        # Ensure numeric
+        df['Last_Login_Days'] = pd.to_numeric(df['Last_Login_Days'], errors='coerce').fillna(0)
         risk_df = df[df['Last_Login_Days'] > 7].copy()
+        st.info(f"Filtering for users inactive > 7 days. Found {len(risk_df)} users.")
+    else:
+        # No filter - treat EVERYONE as a target
+        risk_df = df.copy()
+        risk_df['Last_Login_Days'] = "Unknown" # Placeholder
+        st.info(f"No 'Days Inactive' column mapped. Selecting ALL {len(risk_df)} users for drafting.")
         
         # Initialize 'Select' column for checkboxes
         if 'Select' not in risk_df.columns:
@@ -163,15 +229,17 @@ if uploaded_file:
                      
                      with st.spinner(f"Gemini ({MODEL_NAME}) is drafting using your custom prompt..."):
                          def draft_with_ai(row):
-                             days = int(row['Last_Login_Days']) if pd.notnull(row['Last_Login_Days']) else 0
-                             name = row.get('Name', 'there')
-                             if pd.isna(name): name = 'there'
-                             
-                             # Use the Custom PROMPT_TEMPLATE
+                             # 1. Turn the entire row into a readable string
                              try:
-                                 prompt = PROMPT_TEMPLATE.format(name=name, days=days)
+                                 user_context = row.to_json()
+                             except Exception as e:
+                                 return f"Error serializing row: {e}"
+                             
+                             # 2. Use the Custom PROMPT_TEMPLATE with the full context
+                             try:
+                                 prompt = PROMPT_TEMPLATE.format(user_context=user_context)
                              except KeyError as e:
-                                 return f"Error: Prompt template has invalid placeholder {e}"
+                                 return f"Error: Prompt template has invalid placeholder {e}. Make sure to use {{user_context}}."
                                  
                              try:
                                  response = model.generate_content(prompt)
@@ -327,5 +395,4 @@ if uploaded_file:
                 
                 st.success(f"Sent {slack_success} alerts to Slack!")
 
-    else:
-        st.warning("CSV must contain 'Last_Login_Days' column to detect churn.")
+
