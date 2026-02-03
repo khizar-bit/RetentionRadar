@@ -148,6 +148,12 @@ Just the message text."""
         key="prompt_input",
         on_change=save_prompt
     )
+    
+    if st.button("🔄 Reset to Default Prompt"):
+        if os.path.exists(PROMPT_FILE):
+            os.remove(PROMPT_FILE)
+        st.session_state["prompt_input"] = load_prompt()
+        st.rerun()
 
 WHATSAPP_NUMBER_SOURCE = "whatsapp" # Default channel
 
