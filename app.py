@@ -16,6 +16,7 @@ st.sidebar.header("Configuration")
 # Credentials Inputs
 SPUR_API_KEY = st.sidebar.text_input("Spur API Bearer Token", type="password", help="Found in Spur Settings > API")
 GEMINI_API_KEY = st.sidebar.text_input("Gemini API Key", type="password", help="Get it from aistudio.google.com")
+SLACK_WEBHOOK_URL = st.sidebar.text_input("Slack Webhook URL", type="password", help="Optional: For internal alerts")
 
 # Model & AI Configuration
 with st.sidebar.expander("🤖 AI Settings", expanded=True):
@@ -222,6 +223,30 @@ if uploaded_file:
                     progress_bar.progress((i + 1) / count_selected)
 
                 st.success(f"Done! Sent {success_count} messages.")
+
+        st.write("---")
+        if st.button(f"📢 Send Slack Alerts for {count_selected} Selected", disabled=(count_selected == 0), help="Send an internal alert to your team about these specific users."):
+            if not SLACK_WEBHOOK_URL:
+                st.error("Please enter a Slack Webhook URL in the sidebar.")
+            else:
+                progress_bar_slack = st.progress(0)
+                slack_success = 0
+                
+                for i, (index, row) in enumerate(selected_rows.iterrows()):
+                    # Construct Slack Payload
+                    slack_msg = {
+                        "text": f"🚨 *Churn Risk Detected*\n*Customer:* {row.get('Name', 'Unknown')}\n*Phone:* {row.get('Phone', 'N/A')}\n*Inactive Days:* {row['Last_Login_Days']}\n*Proposed Message:* _{row.get('Draft_Message', 'N/A')}_"
+                    }
+                    
+                    try:
+                        requests.post(SLACK_WEBHOOK_URL, json=slack_msg)
+                        slack_success += 1
+                    except Exception as e:
+                        st.error(f"Slack Error: {e}")
+                    
+                    progress_bar_slack.progress((i + 1) / count_selected)
+                
+                st.success(f"Sent {slack_success} alerts to Slack!")
 
     else:
         st.warning("CSV must contain 'Last_Login_Days' column to detect churn.")
