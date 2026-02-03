@@ -136,9 +136,19 @@ Just the message text."""
             json.dump({"prompt": new_prompt}, f)
         st.toast("Prompt saved!")
 
+    def reset_prompt():
+        if os.path.exists(PROMPT_FILE):
+            os.remove(PROMPT_FILE)
+        st.session_state["reset_prompt_requested"] = True
+        st.toast("Prompt reset to default!")
+
     # Initialize session state for prompt if not exists
     if "prompt_input" not in st.session_state:
         st.session_state["prompt_input"] = load_prompt()
+
+    if st.session_state.get("reset_prompt_requested"):
+        st.session_state["prompt_input"] = load_prompt()
+        st.session_state["reset_prompt_requested"] = False
 
     PROMPT_TEMPLATE = st.text_area(
         "Edit the instructions for the AI:", 
@@ -148,12 +158,8 @@ Just the message text."""
         key="prompt_input",
         on_change=save_prompt
     )
-    
-    if st.button("🔄 Reset to Default Prompt"):
-        if os.path.exists(PROMPT_FILE):
-            os.remove(PROMPT_FILE)
-        st.session_state["prompt_input"] = load_prompt()
-        st.rerun()
+
+    st.button("🔄 Reset to Default Prompt", on_click=reset_prompt)
 
 WHATSAPP_NUMBER_SOURCE = "whatsapp" # Default channel
 
