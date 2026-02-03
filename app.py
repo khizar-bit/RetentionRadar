@@ -71,10 +71,19 @@ st.sidebar.header("Configuration")
 # Credentials Inputs
 # Helper function to handle secrets vs manual input
 def get_secret(key_name, label, help_text):
-    # Check if key exists in secrets and is not the default placeholder
-    if key_name in st.secrets and st.secrets[key_name] and "YOUR_" not in st.secrets[key_name]:
+    # Check if key exists in secrets (case-insensitive try)
+    secret_val = st.secrets.get(key_name)
+    if not secret_val:
+        # Try finding it in other sections or lowercase
+        for k, v in st.secrets.items():
+            if k.lower() == key_name.lower():
+                secret_val = v
+                break
+    
+    # Check validity
+    if secret_val and "YOUR_" not in str(secret_val):
         st.sidebar.text_input(label, value="Securely Configured", disabled=True, type="password")
-        return st.secrets[key_name]
+        return secret_val
     else:
         return st.sidebar.text_input(label, type="password", help=help_text)
 
@@ -205,208 +214,334 @@ if uploaded_file:
     df = df.rename(columns=rename_map)
 
     # 3. Filtering Logic
+    risk_df = None
+    
     if 'Last_Login_Days' in df.columns:
-        # Filter for At Risk Users (> 7 days inactive)
-        # Ensure numeric
-        df['Last_Login_Days'] = pd.to_numeric(df['Last_Login_Days'], errors='coerce').fillna(0)
-        risk_df = df[df['Last_Login_Days'] > 7].copy()
-        st.info(f"Filtering for users inactive > 7 days. Found {len(risk_df)} users.")
-    else:
+        try:
+            # Handle potential duplicate columns (returns DataFrame instead of Series)
+            col_data = df['Last_Login_Days']
+            if isinstance(col_data, pd.DataFrame):
+                col_data = col_data.iloc[:, 0]
+                
+            # Filter for At Risk Users (> 7 days inactive)
+            # Ensure numeric
+            df['Last_Login_Days'] = pd.to_numeric(col_data, errors='coerce').fillna(0)
+            risk_df = df[df['Last_Login_Days'] > 7].copy()
+            st.info(f"Filtering for users inactive > 7 days. Found {len(risk_df)} users.")
+        except Exception as e:
+            st.warning(f"⚠️ Could not parse 'Last_Login_Days' column correctly ({e}). Proceeding with all users.")
+            risk_df = None
+
+    if risk_df is None:
         # No filter - treat EVERYONE as a target
         risk_df = df.copy()
-        risk_df['Last_Login_Days'] = "Unknown" # Placeholder
-        st.info(f"No 'Days Inactive' column mapped. Selecting ALL {len(risk_df)} users for drafting.")
-        
-        # Initialize 'Select' column for checkboxes
-        if 'Select' not in risk_df.columns:
-            risk_df.insert(0, 'Select', False)
-        
-        # 3. The AI Drafter
-        st.write("---")
-        st.subheader(f"🚨 At Risk Users ({len(risk_df)})")
-        
-        # AI Draft Button at the top
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            generate_ai = st.button("✨ Generate AI Drafts")
-        
-        # Logic to generate drafts if button clicked
-        if generate_ai:
-             if not GEMINI_API_KEY:
-                 st.warning("⚠️ Please enter your Gemini API Key in the sidebar first.")
-             else:
-                 # Configure Gemini
-                 genai.configure(api_key=GEMINI_API_KEY)
-                 
-                 try:
-                     model = genai.GenerativeModel(MODEL_NAME)
-                     
-                     with st.spinner(f"Gemini ({MODEL_NAME}) is drafting using your custom prompt..."):
-                         def draft_with_ai(row):
-                             # 1. Turn the entire row into a readable string
-                             try:
-                                 user_context = row.to_json()
-                             except Exception as e:
-                                 return f"Error serializing row: {e}"
-                             
-                             # 2. Use the Custom PROMPT_TEMPLATE with the full context
-                             try:
-                                 prompt = PROMPT_TEMPLATE.format(user_context=user_context)
-                             except KeyError as e:
-                                 return f"Error: Prompt template has invalid placeholder {e}. Make sure to use {{user_context}}."
-                                 
-                             try:
-                                 response = model.generate_content(prompt)
-                                 return response.text.strip()
-                             except Exception as e:
-                                 return f"Error: {e}"
-                                 
-                         # Apply AI to dataframe
-                         risk_df['Draft_Message'] = risk_df.apply(draft_with_ai, axis=1)
-                         st.success(f"Drafts generated!")
-                         
-                 except Exception as e:
-                     st.error(f"Failed to initialize model '{MODEL_NAME}': {e}")
-        
-        # If no drafts yet, provide fallback so column exists
-        if 'Draft_Message' not in risk_df.columns:
-             def draft_standard(row):
-                days = int(row['Last_Login_Days']) if pd.notnull(row['Last_Login_Days']) else 0
-                name = row.get('Name', 'there')
-                if pd.isna(name): name = 'there'
-                return f"Hey {name}, noticed it's been {days} days since your last login. We miss you!"
-             risk_df['Draft_Message'] = risk_df.apply(draft_standard, axis=1)
-
-        # Show interactive table with Checkboxes
-        edited_df = st.data_editor(
-            risk_df,
-            column_config={
-                "Select": st.column_config.CheckboxColumn(
-                    "Send?",
-                    help="Select users to send messages to",
-                    default=False,
-                ),
-                "Draft_Message": st.column_config.TextColumn(
-                    "Message Content",
-                    width="large"
-                )
-            },
-            disabled=["Name", "Phone", "Last_Login_Days"], # Only let them edit Select and Message
-            hide_index=True,
-            num_rows="dynamic",
-            key="editor"
-        )
-        
-        # Determine how many selected
-        selected_rows = edited_df[edited_df['Select'] == True]
-        count_selected = len(selected_rows)
-
-        # 4. The Sending Logic
-        st.write(f"**Selected Users:** {count_selected}")
-        
-        if st.button(f"Send to {count_selected} Selected Users", type="primary", disabled=(count_selected == 0)):
-            if not SPUR_API_KEY:
-                st.error("Please enter your Spur API Key in the sidebar first!")
-            else:
-                progress_bar = st.progress(0)
-                success_count = 0
+        # Ensure Last_Login_Days exists for display if it wasn't there
+        if 'Last_Login_Days' not in risk_df.columns:
+             risk_df['Last_Login_Days'] = "Unknown" # Placeholder
+        st.info(f"Selecting ALL {len(risk_df)} users for drafting.")
+    
+    # Initialize 'Select' column for checkboxes
+    if 'Select' not in risk_df.columns:
+        risk_df.insert(0, 'Select', False)
+    
+    # 3. The AI Drafter
+    st.write("---")
+    st.subheader(f"🚨 At Risk Users ({len(risk_df)})")
+    
+    # AI Draft Button at the top
+    col1, col2 = st.columns([1, 4])
+    with col1:
+        generate_ai = st.button("✨ Generate AI Drafts")
+    
+    # Logic to generate drafts if button clicked
+    if generate_ai:
+        if not GEMINI_API_KEY:
+            st.warning("⚠️ Please enter your Gemini API Key in the sidebar first.")
+        else:
+            # Configure Gemini
+            genai.configure(api_key=GEMINI_API_KEY)
+            
+            try:
+                model = genai.GenerativeModel(MODEL_NAME)
                 
-                # Iterate ONLY through selected rows
-                for i, (index, row) in enumerate(selected_rows.iterrows()):
-                    phone = str(row['Phone']).replace("+", "").strip() 
-                    if phone.endswith('.0'): phone = phone[:-2]
+                with st.spinner(f"Gemini ({MODEL_NAME}) is drafting using your custom prompt..."):
+                    def draft_with_ai(row):
+                        # 1. Turn the entire row into a readable string
+                        try:
+                            user_context = row.to_json()
+                        except Exception as e:
+                            return f"Error serializing row: {e}"
                         
-                    message_text = row['Draft_Message']
+                        # 2. Use the Custom PROMPT_TEMPLATE with the full context
+                        try:
+                            prompt = PROMPT_TEMPLATE.format(user_context=user_context)
+                        except KeyError as e:
+                            return f"Error: Prompt template has invalid placeholder {e}. Make sure to use {{user_context}}."
+                            
+                        try:
+                            response = model.generate_content(prompt)
+                            return response.text.strip()
+                        except Exception as e:
+                            return f"Error: {e}"
+                            
+                    # Apply AI to dataframe
+                    risk_df['Draft_Message'] = risk_df.apply(draft_with_ai, axis=1)
+                    st.success(f"Drafts generated!")
                     
-                    # 1. Encode message
-                    encoded_text = quote(message_text)
-                    image_url = f"https://api.spurnow.com/screenshot/text-message?text={encoded_text}"
+            except Exception as e:
+                st.error(f"Failed to initialize model '{MODEL_NAME}': {e}")
+    
+    # If no drafts yet, provide fallback so column exists
+    if 'Draft_Message' not in risk_df.columns:
+        def draft_standard(row):
+            name = row.get('Name', 'there')
+            if pd.isna(name):
+                name = 'there'
+            days_val = pd.to_numeric(row.get('Last_Login_Days'), errors='coerce')
+            if pd.isna(days_val):
+                return f"Hey {name}, noticed it's been a while since your last login. We miss you!"
+            return f"Hey {name}, noticed it's been {int(days_val)} days since your last login. We miss you!"
+        risk_df['Draft_Message'] = risk_df.apply(draft_standard, axis=1)
+
+    # Show interactive table with Checkboxes
+    edited_df = st.data_editor(
+        risk_df,
+        column_config={
+            "Select": st.column_config.CheckboxColumn(
+                "Send?",
+                help="Select users to send messages to",
+                default=False,
+            ),
+            "Draft_Message": st.column_config.TextColumn(
+                "Message Content",
+                width="large"
+            )
+        },
+        disabled=["Name", "Phone", "Last_Login_Days"], # Only let them edit Select and Message
+        hide_index=True,
+        num_rows="dynamic",
+        key="editor"
+    )
+    
+    # Determine how many selected
+    selected_rows = edited_df[edited_df['Select'] == True]
+    count_selected = len(selected_rows)
+
+    # 4. The Sending Logic
+    st.write(f"**Selected Users:** {count_selected}")
+    
+    if st.button(f"Send to {count_selected} Selected Users", type="primary", disabled=(count_selected == 0)):
+        if not SPUR_API_KEY:
+            st.error("Please enter your Spur API Key in the sidebar first!")
+        else:
+            progress_bar = st.progress(0)
+            success_count = 0
+            
+            # Iterate ONLY through selected rows
+            for i, (index, row) in enumerate(selected_rows.iterrows()):
+                phone = str(row['Phone']).replace("+", "").strip() 
+                if phone.endswith('.0'): phone = phone[:-2]
                     
-                    # 2. Construct Payload
-                    payload = {
-                        "channel": "whatsapp",
-                        "to": phone,
-                        "content": {
-                            "type": "template",
-                            "template": {
-                                "name": "support_ticket_update_spur",
-                                "language": {"code": "en"},
-                                "components": [
-                                    {
-                                        "type": "header",
-                                        "parameters": [
-                                            {
-                                                "type": "IMAGE",
-                                                "image": {"link": image_url}
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        "type": "body",
-                                        "parameters": [
-                                            {"text": " ", "type": "text"}
-                                        ]
-                                    },
-                                    {
-                                        "type": "button",
-                                        "index": 0,
-                                        "sub_type": "QUICK_REPLY",
-                                        "parameters": [
-                                            {"type": "payload", "payload": "recovery_flow"}
-                                        ]
-                                    }
-                                ]
-                            }
+                message_text = row['Draft_Message']
+                
+                # 1. Encode message
+                encoded_text = quote(message_text)
+                image_url = f"https://api.spurnow.com/screenshot/text-message?text={encoded_text}"
+                
+                # 2. Construct Payload
+                payload = {
+                    "channel": "whatsapp",
+                    "to": phone,
+                    "content": {
+                        "type": "template",
+                        "template": {
+                            "name": "support_ticket_update_spur",
+                            "language": {"code": "en"},
+                            "components": [
+                                {
+                                    "type": "header",
+                                    "parameters": [
+                                        {
+                                            "type": "IMAGE",
+                                            "image": {"link": image_url}
+                                        }
+                                    ]
+                                },
+                                {
+                                    "type": "body",
+                                    "parameters": [
+                                        {"text": " ", "type": "text"}
+                                    ]
+                                },
+                                {
+                                    "type": "button",
+                                    "index": 0,
+                                    "sub_type": "QUICK_REPLY",
+                                    "parameters": [
+                                        {"type": "payload", "payload": "recovery_flow"}
+                                    ]
+                                }
+                            ]
                         }
                     }
+                }
 
-                    # 3. Send Request
-                    headers = {
-                        'Authorization': f'Bearer {SPUR_API_KEY}',
-                        'Content-Type': 'application/json'
-                    }
+                # 3. Send Request
+                headers = {
+                    'Authorization': f'Bearer {SPUR_API_KEY}',
+                    'Content-Type': 'application/json'
+                }
+                
+                try:
+                    response = requests.post(
+                        'https://api.spurnow.com/send-message', 
+                        headers=headers, 
+                        data=json.dumps(payload)
+                    )
                     
-                    try:
-                        response = requests.post(
-                            'https://api.spurnow.com/send-message', 
-                            headers=headers, 
-                            data=json.dumps(payload)
-                        )
+                    if response.status_code == 200:
+                        success_count += 1
+                    else:
+                        st.error(f"Failed for {phone}: {response.text}")
                         
-                        if response.status_code == 200:
-                            success_count += 1
-                        else:
-                            st.error(f"Failed for {phone}: {response.text}")
-                            
-                    except Exception as e:
-                        st.error(f"Error sending to {phone}: {str(e)}")
-                    
-                    progress_bar.progress((i + 1) / count_selected)
-
-                st.success(f"Done! Sent {success_count} messages.")
-
-        st.write("---")
-        if st.button(f"📢 Send Slack Alerts for {count_selected} Selected", disabled=(count_selected == 0), help="Send an internal alert to your team about these specific users."):
-            if not SLACK_WEBHOOK_URL:
-                st.error("Please enter a Slack Webhook URL in the sidebar.")
-            else:
-                progress_bar_slack = st.progress(0)
-                slack_success = 0
+                except Exception as e:
+                    st.error(f"Error sending to {phone}: {str(e)}")
                 
-                for i, (index, row) in enumerate(selected_rows.iterrows()):
-                    # Construct Slack Payload
-                    slack_msg = {
-                        "text": f"🚨 *Churn Risk Detected*\n*Customer:* {row.get('Name', 'Unknown')}\n*Phone:* {row.get('Phone', 'N/A')}\n*Inactive Days:* {row['Last_Login_Days']}\n*Proposed Message:* _{row.get('Draft_Message', 'N/A')}_"
-                    }
-                    
+                progress_bar.progress((i + 1) / count_selected)
+
+            st.success(f"Done! Sent {success_count} messages.")
+
+    st.write("---")
+    if st.button(f"📢 Send Slack Alerts for {count_selected} Selected", disabled=(count_selected == 0), help="Send an internal alert to your team about these specific users."):
+        if not SLACK_WEBHOOK_URL:
+            st.error("Please enter a Slack Webhook URL in the sidebar.")
+        else:
+            progress_bar_slack = st.progress(0)
+            slack_success = 0
+            
+            for i, (index, row) in enumerate(selected_rows.iterrows()):
+                # Construct Slack Payload
+                slack_msg = {
+                    "text": f"🚨 *Churn Risk Detected*\n*Customer:* {row.get('Name', 'Unknown')}\n*Phone:* {row.get('Phone', 'N/A')}\n*Inactive Days:* {row['Last_Login_Days']}\n*Proposed Message:* _{row.get('Draft_Message', 'N/A')}_"
+                }
+                
+                try:
+                    requests.post(SLACK_WEBHOOK_URL, json=slack_msg)
+                    slack_success += 1
+                except Exception as e:
+                    st.error(f"Slack Error: {e}")
+                
+                progress_bar_slack.progress((i + 1) / count_selected)
+            
+            st.success(f"Sent {slack_success} alerts to Slack!")
+
+    # 5. Single Customer Outreach
+    st.write("---")
+    st.subheader("⚡ Single Customer Outreach")
+    
+    label_map = {
+        f"{row.get('Name', 'Unknown')} | {row.get('Phone', '')} | Row {idx}": idx
+        for idx, row in edited_df.iterrows()
+    }
+    
+    if label_map:
+        selected_label = st.selectbox("Choose a customer", list(label_map.keys()))
+        selected_idx = label_map[selected_label]
+        selected_row = edited_df.loc[selected_idx]
+        
+        if st.session_state.get("single_customer_label") != selected_label:
+            st.session_state["single_customer_label"] = selected_label
+            st.session_state["single_message"] = selected_row.get("Draft_Message", "")
+        
+        st.text_area(
+            "Message for selected customer",
+            key="single_message",
+            height=120
+        )
+        
+        single_col1, single_col2 = st.columns([1, 1])
+        with single_col1:
+            if st.button("✨ Generate AI Message", key="generate_single"):
+                if not GEMINI_API_KEY:
+                    st.warning("⚠️ Please enter your Gemini API Key in the sidebar first.")
+                else:
+                    genai.configure(api_key=GEMINI_API_KEY)
                     try:
-                        requests.post(SLACK_WEBHOOK_URL, json=slack_msg)
-                        slack_success += 1
+                        model = genai.GenerativeModel(MODEL_NAME)
+                        user_context = selected_row.to_json()
+                        prompt = PROMPT_TEMPLATE.format(user_context=user_context)
+                        response = model.generate_content(prompt)
+                        st.session_state["single_message"] = response.text.strip()
+                        st.success("AI message generated for this customer.")
+                    except KeyError as e:
+                        st.error(f"Error: Prompt template has invalid placeholder {e}. Make sure to use {{user_context}}.")
                     except Exception as e:
-                        st.error(f"Slack Error: {e}")
-                    
-                    progress_bar_slack.progress((i + 1) / count_selected)
-                
-                st.success(f"Sent {slack_success} alerts to Slack!")
+                        st.error(f"Error generating message: {e}")
+        
+        with single_col2:
+            if st.button("📤 Send Message", key="send_single"):
+                if not SPUR_API_KEY:
+                    st.error("Please enter your Spur API Key in the sidebar first!")
+                else:
+                    message_text = st.session_state.get("single_message", "").strip()
+                    if not message_text:
+                        st.warning("Please generate or enter a message before sending.")
+                    else:
+                        phone = str(selected_row['Phone']).replace("+", "").strip()
+                        if phone.endswith('.0'): phone = phone[:-2]
+                        encoded_text = quote(message_text)
+                        image_url = f"https://api.spurnow.com/screenshot/text-message?text={encoded_text}"
+                        payload = {
+                            "channel": "whatsapp",
+                            "to": phone,
+                            "content": {
+                                "type": "template",
+                                "template": {
+                                    "name": "support_ticket_update_spur",
+                                    "language": {"code": "en"},
+                                    "components": [
+                                        {
+                                            "type": "header",
+                                            "parameters": [
+                                                {
+                                                    "type": "IMAGE",
+                                                    "image": {"link": image_url}
+                                                }
+                                            ]
+                                        },
+                                        {
+                                            "type": "body",
+                                            "parameters": [
+                                                {"text": " ", "type": "text"}
+                                            ]
+                                        },
+                                        {
+                                            "type": "button",
+                                            "index": 0,
+                                            "sub_type": "QUICK_REPLY",
+                                            "parameters": [
+                                                {"type": "payload", "payload": "recovery_flow"}
+                                            ]
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                        headers = {
+                            'Authorization': f'Bearer {SPUR_API_KEY}',
+                            'Content-Type': 'application/json'
+                        }
+                        try:
+                            response = requests.post(
+                                'https://api.spurnow.com/send-message',
+                                headers=headers,
+                                data=json.dumps(payload)
+                            )
+                            if response.status_code == 200:
+                                st.success("Message sent!")
+                            else:
+                                st.error(f"Failed for {phone}: {response.text}")
+                        except Exception as e:
+                            st.error(f"Error sending to {phone}: {str(e)}")
 
 
