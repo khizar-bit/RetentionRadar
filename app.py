@@ -211,7 +211,23 @@ if uploaded_file:
     if login_col != "None":
         rename_map[login_col] = 'Last_Login_Days'
     
+    # Avoid collisions: if target 'Name' exists but isn't being renamed, it will duplicate.
+    # We rename the existing one out of the way.
+    for source, target in rename_map.items():
+        if target in df.columns and source != target:
+            # If the target column name exists and is NOT being renamed itself (not in keys)
+            if target not in rename_map:
+                new_col = f"{target}_original"
+                counter = 1
+                while new_col in df.columns:
+                    new_col = f"{target}_original_{counter}"
+                    counter += 1
+                df.rename(columns={target: new_col}, inplace=True)
+
     df = df.rename(columns=rename_map)
+    
+    # Final cleanup: remove any duplicates if they somehow persist
+    df = df.loc[:, ~df.columns.duplicated()]
 
     # 3. Filtering Logic
     risk_df = None
@@ -297,7 +313,13 @@ if uploaded_file:
             name = row.get('Name', 'there')
             if pd.isna(name):
                 name = 'there'
-            days_val = pd.to_numeric(row.get('Last_Login_Days'), errors='coerce')
+            
+            raw_days = row.get('Last_Login_Days')
+            # Handle duplicate columns (if raw_days is a Series)
+            if isinstance(raw_days, pd.Series):
+                raw_days = raw_days.iloc[0]
+            
+            days_val = pd.to_numeric(raw_days, errors='coerce')
             if pd.isna(days_val):
                 return f"Hey {name}, noticed it's been a while since your last login. We miss you!"
             return f"Hey {name}, noticed it's been {int(days_val)} days since your last login. We miss you!"
@@ -336,6 +358,7 @@ if uploaded_file:
         else:
             progress_bar = st.progress(0)
             success_count = 0
+            success_details = []
             
             # Iterate ONLY through selected rows
             for i, (index, row) in enumerate(selected_rows.iterrows()):
@@ -399,8 +422,9 @@ if uploaded_file:
                         data=json.dumps(payload)
                     )
                     
-                    if response.status_code == 200:
+                    if response.ok:
                         success_count += 1
+                        success_details.append({'Name': row.get('Name', 'Unknown'), 'Phone': phone})
                     else:
                         st.error(f"Failed for {phone}: {response.text}")
                         
@@ -410,6 +434,12 @@ if uploaded_file:
                 progress_bar.progress((i + 1) / count_selected)
 
             st.success(f"Done! Sent {success_count} messages.")
+            
+            if success_details:
+                st.write("### 🔍 Verify Sent Messages")
+                for item in success_details:
+                    url = f"https://spur.chat/{item['Phone']}"
+                    st.markdown(f"- **{item['Name']}**: [spur.chat/{item['Phone']}]({url})")
 
     st.write("---")
     if st.button(f"📢 Send Slack Alerts for {count_selected} Selected", disabled=(count_selected == 0), help="Send an internal alert to your team about these specific users."):
@@ -452,6 +482,8 @@ if uploaded_file:
         if st.session_state.get("single_customer_label") != selected_label:
             st.session_state["single_customer_label"] = selected_label
             st.session_state["single_message"] = selected_row.get("Draft_Message", "")
+            st.session_state["single_gen_error"] = None
+            st.session_state["single_gen_success"] = None
         
         st.text_area(
             "Message for selected customer",
@@ -459,24 +491,41 @@ if uploaded_file:
             height=120
         )
         
+        def generate_single_callback(api_key, model_name, row, prompt_tmpl):
+            if not api_key:
+                st.session_state["single_gen_error"] = "⚠️ Please enter your Gemini API Key in the sidebar first."
+                return
+
+            genai.configure(api_key=api_key)
+            try:
+                model = genai.GenerativeModel(model_name)
+                user_context = row.to_json()
+                prompt = prompt_tmpl.format(user_context=user_context)
+                response = model.generate_content(prompt)
+                st.session_state["single_message"] = response.text.strip()
+                st.session_state["single_gen_success"] = "AI message generated for this customer."
+                st.session_state["single_gen_error"] = None
+            except KeyError as e:
+                st.session_state["single_gen_error"] = f"Error: Prompt template has invalid placeholder {e}. Make sure to use {{user_context}}."
+                st.session_state["single_gen_success"] = None
+            except Exception as e:
+                st.session_state["single_gen_error"] = f"Error generating message: {e}"
+                st.session_state["single_gen_success"] = None
+
         single_col1, single_col2 = st.columns([1, 1])
         with single_col1:
-            if st.button("✨ Generate AI Message", key="generate_single"):
-                if not GEMINI_API_KEY:
-                    st.warning("⚠️ Please enter your Gemini API Key in the sidebar first.")
+            st.button("✨ Generate AI Message", key="generate_single",
+                      on_click=generate_single_callback,
+                      args=(GEMINI_API_KEY, MODEL_NAME, selected_row, PROMPT_TEMPLATE))
+            
+            if st.session_state.get("single_gen_error"):
+                if "⚠️" in st.session_state["single_gen_error"]:
+                     st.warning(st.session_state["single_gen_error"])
                 else:
-                    genai.configure(api_key=GEMINI_API_KEY)
-                    try:
-                        model = genai.GenerativeModel(MODEL_NAME)
-                        user_context = selected_row.to_json()
-                        prompt = PROMPT_TEMPLATE.format(user_context=user_context)
-                        response = model.generate_content(prompt)
-                        st.session_state["single_message"] = response.text.strip()
-                        st.success("AI message generated for this customer.")
-                    except KeyError as e:
-                        st.error(f"Error: Prompt template has invalid placeholder {e}. Make sure to use {{user_context}}.")
-                    except Exception as e:
-                        st.error(f"Error generating message: {e}")
+                     st.error(st.session_state["single_gen_error"])
+            
+            if st.session_state.get("single_gen_success"):
+                st.success(st.session_state["single_gen_success"])
         
         with single_col2:
             if st.button("📤 Send Message", key="send_single"):
@@ -537,8 +586,10 @@ if uploaded_file:
                                 headers=headers,
                                 data=json.dumps(payload)
                             )
-                            if response.status_code == 200:
+                            if response.ok:
                                 st.success("Message sent!")
+                                url = f"https://spur.chat/{phone}"
+                                st.markdown(f"👉 [spur.chat/{phone}]({url})")
                             else:
                                 st.error(f"Failed for {phone}: {response.text}")
                         except Exception as e:
