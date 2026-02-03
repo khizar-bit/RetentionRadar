@@ -5,43 +5,122 @@ import json
 import google.generativeai as genai
 import time
 from urllib.parse import quote
+import os
+import extra_streamlit_components as stx
+import datetime
 
 # Page Config
 st.set_page_config(page_title="Retention Radar", page_icon="📡", layout="wide")
 
 # Title and Sidebar
+# Title and Sidebar
 st.title("📡 Retention Radar")
+
+# --- Authentication ---
+def check_password():
+    """Returns `True` if the user had the correct password."""
+    
+    if "APP_PASSWORD" not in st.secrets:
+        st.warning("⚠️ ADD 'APP_PASSWORD' to .streamlit/secrets.toml")
+        return False
+
+    # Initialize Cookie Manager
+    cookie_manager = stx.CookieManager()
+
+    # Wait for cookies to load
+    if "auth_token" not in st.session_state:
+        # Check if cookie exists
+        cookie_val = cookie_manager.get(cookie="auth_token")
+        if cookie_val == st.secrets["APP_PASSWORD"]:
+            st.session_state["password_correct"] = True
+            return True
+        st.session_state["auth_token"] = cookie_val
+
+    def password_entered():
+        """Checks whether a password entered by the user is correct."""
+        if st.session_state["password"] == st.secrets["APP_PASSWORD"]:
+            st.session_state["password_correct"] = True
+            # Set cookie (expires in 30 days)
+            cookie_manager.set("auth_token", st.secrets["APP_PASSWORD"], expires_at=datetime.datetime.now() + datetime.timedelta(days=30))
+            del st.session_state["password"]  # don't store password
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        # First run, show input
+        st.text_input(
+            "Password", type="password", on_change=password_entered, key="password"
+        )
+        return False
+    elif not st.session_state["password_correct"]:
+        # Password incorrect, show input + error
+        st.text_input(
+            "Password", type="password", on_change=password_entered, key="password"
+        )
+        st.error("😕 Password incorrect")
+        return False
+    else:
+        # Password correct
+        return True
+
+if not check_password():
+    st.stop()
+    
 st.sidebar.header("Configuration")
 
 # Credentials Inputs
-SPUR_API_KEY = st.sidebar.text_input("Spur API Bearer Token", type="password", help="Found in Spur Settings > API")
-GEMINI_API_KEY = st.sidebar.text_input("Gemini API Key", type="password", help="Get it from aistudio.google.com")
-SLACK_WEBHOOK_URL = st.sidebar.text_input("Slack Webhook URL", type="password", help="Optional: For internal alerts")
+# Helper function to handle secrets vs manual input
+def get_secret(key_name, label, help_text):
+    # Check if key exists in secrets and is not the default placeholder
+    if key_name in st.secrets and st.secrets[key_name] and "YOUR_" not in st.secrets[key_name]:
+        st.sidebar.text_input(label, value="Securely Configured", disabled=True, type="password")
+        return st.secrets[key_name]
+    else:
+        return st.sidebar.text_input(label, type="password", help=help_text)
+
+SPUR_API_KEY = get_secret("SPUR_API_KEY", "Spur API Bearer Token", "Found in Spur Settings > API")
+GEMINI_API_KEY = get_secret("GEMINI_API_KEY", "Gemini API Key", "Get it from aistudio.google.com")
+SLACK_WEBHOOK_URL = get_secret("SLACK_WEBHOOK_URL", "Slack Webhook URL", "Optional: For internal alerts")
 
 # Model & AI Configuration
 with st.sidebar.expander("🤖 AI Settings", expanded=True):
-    # Model Selection
-    MODEL_NAME = st.text_input("Model Name", value="gemini-1.5-flash", help="e.g. gemini-1.5-flash, gemini-pro")
-    
-    if GEMINI_API_KEY and st.button("Check Available Models"):
-        try:
-            genai.configure(api_key=GEMINI_API_KEY)
-            models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-            st.success(f"Found {len(models)} models:")
-            st.code("\n".join(models))
-        except Exception as e:
-            st.error(f"Error listing models: {str(e)}")
+    # Hardcoded Model
+    MODEL_NAME = "gemini-3-flash-preview"
+    st.info(f"Using Model: `{MODEL_NAME}`")
             
-    # Prompt Template
+    # Prompt Configuration with Persistence
     st.markdown("### 📝 Prompt Template")
-    DEFAULT_PROMPT = """Write a short, friendly, and persuasive WhatsApp recovery message (maximum 20 words) for a customer named '{name}' who hasn't logged into our app for {days} days.
+    PROMPT_FILE = "prompt_config.json"
+
+    def load_prompt():
+        default_prompt = """Write a short, friendly, and persuasive WhatsApp recovery message (maximum 20 words) for a customer named '{name}' who hasn't logged into our app for {days} days.
 Do not include hashtags. Do not include 'Subject:'. Just the message body."""
-    
+        if os.path.exists(PROMPT_FILE):
+            try:
+                with open(PROMPT_FILE, "r") as f:
+                    return json.load(f).get("prompt", default_prompt)
+            except:
+                return default_prompt
+        return default_prompt
+
+    def save_prompt():
+        # Callback to save prompt when changed
+        new_prompt = st.session_state["prompt_input"]
+        with open(PROMPT_FILE, "w") as f:
+            json.dump({"prompt": new_prompt}, f)
+        st.toast("Prompt saved!")
+
+    # Initialize session state for prompt if not exists
+    if "prompt_input" not in st.session_state:
+        st.session_state["prompt_input"] = load_prompt()
+
     PROMPT_TEMPLATE = st.text_area(
         "Edit the instructions for the AI:", 
-        value=DEFAULT_PROMPT,
+        value=st.session_state["prompt_input"],
         height=200,
-        help="Use {name} and {days} as placeholders. They will be replaced automatically."
+        help="Use {name} and {days} as placeholders. They will be replaced automatically.",
+        key="prompt_input",
+        on_change=save_prompt
     )
 
 WHATSAPP_NUMBER_SOURCE = "whatsapp" # Default channel
